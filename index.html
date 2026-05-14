@@ -3,9 +3,31 @@
 <head>
   <meta charset="utf-8">
   <title>KCC MedHub</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+    button { padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer; }
+    .hidden { display: none; }
+    #user-email { font-weight: 600; }
+    #status { color: #b00; margin-top: 1rem; font-family: monospace; white-space: pre-wrap; }
+  </style>
+  <!-- MSAL v3 (last v3 patch) — TODO: upgrade to v5 in future milestone -->
+  <script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@3.27.0/lib/msal-browser.min.js"></script>
+  <script src="config.js"></script>
+  <script src="auth.js"></script>
 </head>
 <body>
   <h1>KCC MedHub</h1>
-  <p>Hello from GitHub Pages. Build in progress.</p>
+
+  <div id="signed-out" class="hidden">
+    <p>Sign in with your Cardea Microsoft account to continue.</p>
+    <button id="sign-in-btn">Sign in with Microsoft</button>
+  </div>
+
+  <div id="signed-in" class="hidden">
+    <p>Signed in as: <span id="user-email"></span></p>
+    <button id="sign-out-btn">Sign out</button>
+  </div>
+
+  <div id="status"></div>
 </body>
 </html>
