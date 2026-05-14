@@ -4,4 +4,3 @@ _reference/
 node_modules/
 .DS_Store
 config.local.js
-config.js

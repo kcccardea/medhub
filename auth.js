@@ -6,7 +6,7 @@
 (function () {
   const cfg = window.MEDHUB_CONFIG;
   if (!cfg || !cfg.clientId || !cfg.tenantId || cfg.clientId === 'REPLACE_ME') {
-    console.error('[MedHub] config.js missing or contains placeholder values. Copy config.example.js to config.js and fill in real Entra clientId and tenantId.');
+    console.error('[MedHub] config.js missing or contains placeholder values. Fill in real Entra clientId and tenantId in config.js.');
     return;
   }
 
