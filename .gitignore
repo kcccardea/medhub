@@ -1,0 +1,7 @@
+_reference/
+*.xlsx
+.env
+node_modules/
+.DS_Store
+config.local.js
+config.js
