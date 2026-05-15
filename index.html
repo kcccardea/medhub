@@ -9,11 +9,15 @@
     .hidden { display: none; }
     #user-email { font-weight: 600; }
     #status { color: #b00; margin-top: 1rem; font-family: monospace; white-space: pre-wrap; }
+    #load-status { margin-top: 1rem; }
+    #load-status.error { color: #b00; font-family: monospace; }
+    #test-patient-view { margin-top: 0.5rem; }
   </style>
   <!-- MSAL v3 (last v3 patch) — TODO: upgrade to v5 in future milestone -->
   <script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@3.27.0/lib/msal-browser.min.js"></script>
   <script src="config.js"></script>
   <script src="auth.js"></script>
+  <script src="data.js"></script>
 </head>
 <body>
   <h1>KCC MedHub</h1>
@@ -26,6 +30,10 @@
   <div id="signed-in" class="hidden">
     <p>Signed in as: <span id="user-email"></span></p>
     <button id="sign-out-btn">Sign out</button>
+    <p id="load-status">Loading medications…</p>
+    <button id="add-test-row-btn" class="hidden">Add test row</button>
+    <button id="view-test-patient-btn" class="hidden">View test patient</button>
+    <div id="test-patient-view"></div>
   </div>
 
   <div id="status"></div>

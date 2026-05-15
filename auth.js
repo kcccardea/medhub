@@ -73,6 +73,7 @@
       signedOutDiv.classList.add('hidden');
       signedInDiv.classList.remove('hidden');
       userEmailSpan.textContent = account.username || account.name || '(unknown)';
+      window.dispatchEvent(new CustomEvent('medhub-signed-in'));
     } else {
       signedInDiv.classList.add('hidden');
       signedOutDiv.classList.remove('hidden');
@@ -107,7 +108,31 @@
     return app.getActiveAccount() || app.getAllAccounts()[0] || null;
   }
 
-  window.medhubAuth = { signIn, signOut, getAccount };
+  // Returns an access token for the given scopes. Tries silent acquisition first;
+  // on InteractionRequiredAuthError, falls back to redirect sign-in per M4.3 spec.
+  async function acquireToken(scopes) {
+    if (!app) throw new Error('MSAL not initialized.');
+    const account = getAccount();
+    if (!account) throw new Error('No active account; sign in first.');
+    try {
+      const result = await app.acquireTokenSilent({ scopes, account });
+      return result.accessToken;
+    } catch (err) {
+      if (err instanceof msal.InteractionRequiredAuthError) {
+        console.info('[MedHub auth] silent token failed; falling back to redirect sign-in');
+        await app.acquireTokenRedirect({ scopes });
+        // acquireTokenRedirect navigates away from the page, so any code after this
+        // line never executes. Returning a never-resolving Promise prevents the
+        // caller from proceeding with an undefined token during the redirect
+        // transition. The flow restarts on the post-redirect page when init() runs
+        // again and handleRedirectPromise() picks up the new token.
+        return new Promise(function () {});
+      }
+      throw err;
+    }
+  }
+
+  window.medhubAuth = { signIn, signOut, getAccount, acquireToken };
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
