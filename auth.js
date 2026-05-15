@@ -29,7 +29,7 @@
   };
 
   const loginRequest = {
-    scopes: ['Files.ReadWrite', 'Files.ReadWrite.All', 'User.Read'],
+    scopes: ['Files.ReadWrite', 'User.Read'],
   };
 
   let app;

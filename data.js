@@ -22,7 +22,7 @@
   const OWNER_FALLBACK_PATH = '/me/drive/root:/KCC/KCC_Master.xlsx';
 
   const TABLE_NAME = 'Medications';
-  const SCOPES = ['Files.ReadWrite', 'Files.ReadWrite.All'];
+  const SCOPES = ['Files.ReadWrite'];
 
   // Typed errors used by the load + write flows to map to friendly UI messages.
   // Any thrown Error with a .medhubCode property is treated as a known case;
