@@ -1,4 +1,14 @@
-// MedHub v2 — data layer (Graph read of KCC_Master.xlsx). Milestone 4.1.
+// MedHub v2 — data layer (Graph read/write of KCC_Master.xlsx).
+//
+// ARCHITECTURE (M6): the workbook lives on the KCCHealthDataHub SharePoint site
+// in the Cardea Health tenant. Access is governed by SharePoint site membership
+// with Edit permissions — NOT by per-file OneDrive shares. Adding a new nurse =
+// adding them as a site member; no per-file sharing required.
+//
+// Resolution path:
+//   1. GET /sites/{hostname}:{site-path}        → siteId
+//   2. GET /sites/{siteId}/drive/root:/{file}   → driveId + itemId
+// Subsequent reads/writes use /drives/{driveId}/items/{itemId}/workbook/...
 //
 // PHI HANDLING: this module touches real patient data. Console output MUST be
 // structural only — counts, rowIndex values/ranges, HTTP status codes, Graph
@@ -12,14 +22,9 @@
 
 (function () {
   const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
-  const WORKBOOK_FILENAME = 'KCC_Master.xlsx';
-  const SHARED_WITH_ME_PATH = '/me/drive/sharedWithMe';
-
-  // Owner-only fallback. KCCnurse's own workbook does not appear in her
-  // sharedWithMe; everyone else must resolve via sharedWithMe. Remove this
-  // constant and the fallback branch entirely if/when we migrate to SharePoint.
-  const OWNER_UPN = 'kccnurse@cardeahealth.org';
-  const OWNER_FALLBACK_PATH = '/me/drive/root:/KCC/KCC_Master.xlsx';
+  const SP_HOSTNAME = 'netorgft8057886.sharepoint.com';
+  const SP_SITE_PATH = '/sites/KCCHealthDataHub';
+  const SP_FILE_PATH = 'KCC_Master.xlsx';  // relative to default document library root
 
   const TABLE_NAME = 'Medications';
   const SCOPES = ['Files.ReadWrite'];
@@ -27,8 +32,7 @@
   // Typed errors used by the load + write flows to map to friendly UI messages.
   // Any thrown Error with a .medhubCode property is treated as a known case;
   // everything else passes through to the raw status/code formatter.
-  const ERR_WORKBOOK_NOT_SHARED = 'WORKBOOK_NOT_SHARED';
-  const ERR_WORKBOOK_AMBIGUOUS = 'WORKBOOK_AMBIGUOUS';
+  const ERR_WORKBOOK_NOT_FOUND = 'WORKBOOK_NOT_FOUND';
   const ERR_WORKBOOK_NO_EDIT_ACCESS = 'WORKBOOK_NO_EDIT_ACCESS';
 
   // 15-column schema per architecture doc §3.1 / §4.2. Order matters — matches A..O.
@@ -134,129 +138,56 @@
     return _sessionId ? { 'workbook-session-id': _sessionId } : {};
   }
 
-  // Resolution order:
-  //   1. sharedWithMe → match by filename (case-insensitive)
-  //   2. owner fallback to /me/drive — only if the signed-in user is OWNER_UPN
-  //      (prevents silently reading a non-owner's stale personal copy)
-  //   3. otherwise: ERR_WORKBOOK_NOT_SHARED
+  // Two-step SharePoint resolution:
+  //   1. /sites/{hostname}:{site-path}        → siteId
+  //   2. /sites/{siteId}/drive/root:/{file}   → driveId + itemId
+  // 403 anywhere → ERR_WORKBOOK_NO_EDIT_ACCESS (caller not a site member).
+  // 404 on site  → ERR_WORKBOOK_NOT_FOUND ("site not found — contact admin").
+  // 404 on file  → ERR_WORKBOOK_NOT_FOUND (file moved/deleted/renamed).
   async function _resolveWorkbook() {
     if (_driveId && _itemId) return;
 
-    // M5.1 diag — remove once multi-user resolution is confirmed working.
-    const _diagAccount = window.medhubAuth.getAccount();
-    const _diagUsername = (_diagAccount && _diagAccount.username) || '';
-    console.info('[MedHub data][diag] _resolveWorkbook start ' + JSON.stringify({
-      username: _diagUsername,
-      ownerUpn: OWNER_UPN,
-      isOwner: _diagUsername.toLowerCase() === OWNER_UPN.toLowerCase(),
-    }));
-
-    const match = await _findInSharedWithMe();
-    console.info('[MedHub data][diag] sharedWithMe match: ' + (match ? 'YES' : 'no'));
-
-    if (match) {
-      _driveId = match.driveId;
-      _itemId = match.itemId;
-      console.info('[MedHub data] workbook resolved via sharedWithMe');
-      return;
-    }
-
-    const account = window.medhubAuth.getAccount();
-    const username = (account && account.username) || '';
-    console.info('[MedHub data][diag] pre-fallback owner gate ' + JSON.stringify({
-      username: username,
-      ownerUpn: OWNER_UPN,
-      willHitFallback: username.toLowerCase() === OWNER_UPN.toLowerCase(),
-    }));
-    if (username.toLowerCase() !== OWNER_UPN.toLowerCase()) {
-      console.info('[MedHub data][diag] throwing ERR_WORKBOOK_NOT_SHARED (non-owner, no sharedWithMe match)');
-      throw _typedError(ERR_WORKBOOK_NOT_SHARED,
-        'Workbook not shared with this account');
+    let siteId;
+    try {
+      const site = await _graph('GET', '/sites/' + SP_HOSTNAME + ':' + SP_SITE_PATH);
+      siteId = site && site.id;
+      if (!siteId) {
+        throw _typedError(ERR_WORKBOOK_NOT_FOUND,
+          'SharePoint site lookup returned no id');
+      }
+    } catch (err) {
+      if (err.medhubCode) throw err;
+      if (err.status === 403) {
+        throw _typedError(ERR_WORKBOOK_NO_EDIT_ACCESS,
+          'No access to SharePoint site');
+      }
+      if (err.status === 404) {
+        throw _typedError(ERR_WORKBOOK_NOT_FOUND,
+          'SharePoint site not found - contact admin');
+      }
+      throw err;
     }
 
     try {
-      const item = await _graph('GET', OWNER_FALLBACK_PATH);
+      const item = await _graph('GET', '/sites/' + siteId + '/drive/root:/' + SP_FILE_PATH);
       _itemId = item.id;
       _driveId = item.parentReference && item.parentReference.driveId;
       if (!_itemId || !_driveId) {
         throw new Error('Could not resolve workbook driveId/itemId.');
       }
-      console.info('[MedHub data] workbook resolved via /me/drive (owner)');
+      console.info('[MedHub data] workbook resolved via SharePoint site');
     } catch (err) {
-      console.info('[MedHub data][diag] owner-fallback catch fired ' + JSON.stringify({
-        status: err && err.status,
-        code: err && err.code,
-        medhubCode: err && err.medhubCode,
-      }));
       if (err.medhubCode) throw err;
+      if (err.status === 403) {
+        throw _typedError(ERR_WORKBOOK_NO_EDIT_ACCESS,
+          'No access to workbook on SharePoint site');
+      }
       if (err.status === 404) {
-        console.info('[MedHub data][diag] translating 404 → ERR_WORKBOOK_NOT_SHARED');
-        throw _typedError(ERR_WORKBOOK_NOT_SHARED,
-          'Workbook not found at owner fallback path');
+        throw _typedError(ERR_WORKBOOK_NOT_FOUND,
+          'Workbook not found on SharePoint site');
       }
       throw err;
     }
-  }
-
-  // Walk sharedWithMe pages, collect items whose name matches WORKBOOK_FILENAME
-  // (case-insensitive). 0 matches → null. 1 match → {driveId, itemId}. ≥2 →
-  // throw ERR_WORKBOOK_AMBIGUOUS with the owner names + lastModifiedDateTime
-  // of each match so the user can tell KCCnurse which old share to revoke.
-  // Page cap of 5 (≈1000 items at the default page size) is a sanity bound;
-  // bump only if a real user hits it.
-  async function _findInSharedWithMe() {
-    console.info('[MedHub data][diag] _findInSharedWithMe entered');
-    let url = SHARED_WITH_ME_PATH;
-    const matches = [];
-    let pages = 0;
-    let totalItems = 0;
-    while (url && pages < 5) {
-      console.info('[MedHub data][diag] sharedWithMe fetch page ' + (pages + 1) + ' url: ' + url);
-      const result = await _graph('GET', url);
-      const items = (result && result.value) || [];
-      totalItems += items.length;
-      // M5.1 diag widened: dump every item's name + remoteItem.name for this run.
-      // Acceptable PHI risk per Everett (totalItems=1 in last run, single user reading own log).
-      // Narrow this back before the diag block is removed.
-      const allNames = items.map(function (it) {
-        return {
-          name: it.name || null,
-          remoteName: (it.remoteItem && it.remoteItem.name) || null,
-        };
-      });
-      console.info('[MedHub data][diag] page ' + (pages + 1)
-        + ' itemCount=' + items.length
-        + ' allNames: ' + JSON.stringify(allNames));
-      for (const it of items) {
-        const remote = it.remoteItem;
-        if (!remote) continue;
-        const name = (it.name || remote.name || '');
-        if (name.toLowerCase() !== WORKBOOK_FILENAME.toLowerCase()) continue;
-        const driveId = remote.parentReference && remote.parentReference.driveId;
-        const itemId = remote.id;
-        if (!driveId || !itemId) continue;
-        matches.push({
-          driveId: driveId,
-          itemId: itemId,
-          ownerName: (remote.shared && remote.shared.owner && remote.shared.owner.user
-            && remote.shared.owner.user.displayName) || '(unknown owner)',
-          lastModified: remote.lastModifiedDateTime || '(unknown date)',
-        });
-      }
-      url = result && result['@odata.nextLink'];
-      pages++;
-    }
-    console.info('[MedHub data][diag] _findInSharedWithMe done ' + JSON.stringify({
-      totalItems: totalItems, matchesAfterFilter: matches.length, pagesRead: pages,
-    }));
-    if (matches.length === 0) return null;
-    if (matches.length === 1) return matches[0];
-    const detail = matches.map(function (m) {
-      return '  • ' + m.ownerName + ' (modified ' + m.lastModified + ')';
-    }).join('\n');
-    throw _typedError(ERR_WORKBOOK_AMBIGUOUS,
-      'Multiple workbooks named ' + WORKBOOK_FILENAME + ' shared with this account',
-      { detail: detail });
   }
 
   // If persistChanges:true 403s (Viewer-only share), fall back to a non-persistent
@@ -453,16 +384,11 @@
       message: err && err.message,
     }));
     if (!err) return 'Unknown error';
-    if (err.medhubCode === ERR_WORKBOOK_NOT_SHARED) {
-      return "This workbook hasn't been shared with your account. Ask KCCnurse to share KCC_Master.xlsx with you with Edit permissions.";
-    }
-    if (err.medhubCode === ERR_WORKBOOK_AMBIGUOUS) {
-      return 'Multiple workbooks named KCC_Master.xlsx are shared with you:\n'
-        + (err.detail || '')
-        + '\nAsk KCCnurse to remove the older share.';
+    if (err.medhubCode === ERR_WORKBOOK_NOT_FOUND) {
+      return 'Could not find KCC_Master.xlsx on the KCCHealthDataHub site. Contact your administrator.';
     }
     if (err.medhubCode === ERR_WORKBOOK_NO_EDIT_ACCESS) {
-      return "You can view this workbook but don't have Edit access. Ask KCCnurse to re-share with Edit permissions.";
+      return 'You need Edit access to the KCCHealthDataHub SharePoint site. Contact your administrator to be added as a site member.';
     }
     if (err.status >= 500 && err.status < 600) return 'Connection error, try again';
     if (err.status) return err.status + ' ' + (err.code || '');
