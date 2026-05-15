@@ -215,17 +215,18 @@
       const result = await _graph('GET', url);
       const items = (result && result.value) || [];
       totalItems += items.length;
-      // Log only names containing 'kcc' or 'master' (case-insensitive) to avoid
-      // dumping unrelated shared filenames that might be patient-identifying.
-      const relevantNames = items
-        .map(function (it) { return (it.name || (it.remoteItem && it.remoteItem.name) || ''); })
-        .filter(function (n) {
-          const ln = n.toLowerCase();
-          return ln.indexOf('kcc') !== -1 || ln.indexOf('master') !== -1;
-        });
+      // M5.1 diag widened: dump every item's name + remoteItem.name for this run.
+      // Acceptable PHI risk per Everett (totalItems=1 in last run, single user reading own log).
+      // Narrow this back before the diag block is removed.
+      const allNames = items.map(function (it) {
+        return {
+          name: it.name || null,
+          remoteName: (it.remoteItem && it.remoteItem.name) || null,
+        };
+      });
       console.info('[MedHub data][diag] page ' + (pages + 1)
         + ' itemCount=' + items.length
-        + ' kcc/master-matching names: ' + JSON.stringify(relevantNames));
+        + ' allNames: ' + JSON.stringify(allNames));
       for (const it of items) {
         const remote = it.remoteItem;
         if (!remote) continue;
