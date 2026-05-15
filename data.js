@@ -12,9 +12,24 @@
 
 (function () {
   const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
-  const WORKBOOK_PATH = '/me/drive/root:/KCC/KCC_Master.xlsx';
+  const WORKBOOK_FILENAME = 'KCC_Master.xlsx';
+  const SHARED_WITH_ME_PATH = '/me/drive/sharedWithMe';
+
+  // Owner-only fallback. KCCnurse's own workbook does not appear in her
+  // sharedWithMe; everyone else must resolve via sharedWithMe. Remove this
+  // constant and the fallback branch entirely if/when we migrate to SharePoint.
+  const OWNER_UPN = 'kccnurse@cardeahealth.org';
+  const OWNER_FALLBACK_PATH = '/me/drive/root:/KCC/KCC_Master.xlsx';
+
   const TABLE_NAME = 'Medications';
   const SCOPES = ['Files.ReadWrite'];
+
+  // Typed errors used by the load + write flows to map to friendly UI messages.
+  // Any thrown Error with a .medhubCode property is treated as a known case;
+  // everything else passes through to the raw status/code formatter.
+  const ERR_WORKBOOK_NOT_SHARED = 'WORKBOOK_NOT_SHARED';
+  const ERR_WORKBOOK_AMBIGUOUS = 'WORKBOOK_AMBIGUOUS';
+  const ERR_WORKBOOK_NO_EDIT_ACCESS = 'WORKBOOK_NO_EDIT_ACCESS';
 
   // 15-column schema per architecture doc §3.1 / §4.2. Order matters — matches A..O.
   const FIELDS = [
@@ -36,6 +51,7 @@
   let _itemId = null;
   let _sessionId = null;
   let _sessionLastUsedAt = null;
+  let _readOnly = false;
   let _meds = [];
   let _byRowIndex = new Map();
   let _loaded = false;
@@ -46,6 +62,13 @@
 
   function _sleep(ms) {
     return new Promise(function (r) { setTimeout(r, ms); });
+  }
+
+  function _typedError(code, message, extra) {
+    const e = new Error(message);
+    e.medhubCode = code;
+    if (extra) Object.assign(e, extra);
+    return e;
   }
 
   // Outer entry: acquire token once per public Graph call. Retries reuse this token.
@@ -111,29 +134,160 @@
     return _sessionId ? { 'workbook-session-id': _sessionId } : {};
   }
 
-  // TODO (M5): replace /me/drive path with /drives/{driveId}/items/{itemId} via
-  // sharedWithMe lookup, per arch doc §3.2 multi-user requirement.
-  // Currently only works if signed-in user owns the workbook.
+  // Resolution order:
+  //   1. sharedWithMe → match by filename (case-insensitive)
+  //   2. owner fallback to /me/drive — only if the signed-in user is OWNER_UPN
+  //      (prevents silently reading a non-owner's stale personal copy)
+  //   3. otherwise: ERR_WORKBOOK_NOT_SHARED
   async function _resolveWorkbook() {
     if (_driveId && _itemId) return;
-    const item = await _graph('GET', WORKBOOK_PATH);
-    _itemId = item.id;
-    _driveId = item.parentReference && item.parentReference.driveId;
-    if (!_itemId || !_driveId) {
-      throw new Error('Could not resolve workbook driveId/itemId.');
+
+    // M5.1 diag — remove once multi-user resolution is confirmed working.
+    const _diagAccount = window.medhubAuth.getAccount();
+    const _diagUsername = (_diagAccount && _diagAccount.username) || '';
+    console.info('[MedHub data][diag] _resolveWorkbook start ' + JSON.stringify({
+      username: _diagUsername,
+      ownerUpn: OWNER_UPN,
+      isOwner: _diagUsername.toLowerCase() === OWNER_UPN.toLowerCase(),
+    }));
+
+    const match = await _findInSharedWithMe();
+    console.info('[MedHub data][diag] sharedWithMe match: ' + (match ? 'YES' : 'no'));
+
+    if (match) {
+      _driveId = match.driveId;
+      _itemId = match.itemId;
+      console.info('[MedHub data] workbook resolved via sharedWithMe');
+      return;
     }
-    console.info('[MedHub data] workbook resolved');
+
+    const account = window.medhubAuth.getAccount();
+    const username = (account && account.username) || '';
+    console.info('[MedHub data][diag] pre-fallback owner gate ' + JSON.stringify({
+      username: username,
+      ownerUpn: OWNER_UPN,
+      willHitFallback: username.toLowerCase() === OWNER_UPN.toLowerCase(),
+    }));
+    if (username.toLowerCase() !== OWNER_UPN.toLowerCase()) {
+      console.info('[MedHub data][diag] throwing ERR_WORKBOOK_NOT_SHARED (non-owner, no sharedWithMe match)');
+      throw _typedError(ERR_WORKBOOK_NOT_SHARED,
+        'Workbook not shared with this account');
+    }
+
+    try {
+      const item = await _graph('GET', OWNER_FALLBACK_PATH);
+      _itemId = item.id;
+      _driveId = item.parentReference && item.parentReference.driveId;
+      if (!_itemId || !_driveId) {
+        throw new Error('Could not resolve workbook driveId/itemId.');
+      }
+      console.info('[MedHub data] workbook resolved via /me/drive (owner)');
+    } catch (err) {
+      console.info('[MedHub data][diag] owner-fallback catch fired ' + JSON.stringify({
+        status: err && err.status,
+        code: err && err.code,
+        medhubCode: err && err.medhubCode,
+      }));
+      if (err.medhubCode) throw err;
+      if (err.status === 404) {
+        console.info('[MedHub data][diag] translating 404 → ERR_WORKBOOK_NOT_SHARED');
+        throw _typedError(ERR_WORKBOOK_NOT_SHARED,
+          'Workbook not found at owner fallback path');
+      }
+      throw err;
+    }
   }
 
+  // Walk sharedWithMe pages, collect items whose name matches WORKBOOK_FILENAME
+  // (case-insensitive). 0 matches → null. 1 match → {driveId, itemId}. ≥2 →
+  // throw ERR_WORKBOOK_AMBIGUOUS with the owner names + lastModifiedDateTime
+  // of each match so the user can tell KCCnurse which old share to revoke.
+  // Page cap of 5 (≈1000 items at the default page size) is a sanity bound;
+  // bump only if a real user hits it.
+  async function _findInSharedWithMe() {
+    console.info('[MedHub data][diag] _findInSharedWithMe entered');
+    let url = SHARED_WITH_ME_PATH;
+    const matches = [];
+    let pages = 0;
+    let totalItems = 0;
+    while (url && pages < 5) {
+      console.info('[MedHub data][diag] sharedWithMe fetch page ' + (pages + 1) + ' url: ' + url);
+      const result = await _graph('GET', url);
+      const items = (result && result.value) || [];
+      totalItems += items.length;
+      // Log only names containing 'kcc' or 'master' (case-insensitive) to avoid
+      // dumping unrelated shared filenames that might be patient-identifying.
+      const relevantNames = items
+        .map(function (it) { return (it.name || (it.remoteItem && it.remoteItem.name) || ''); })
+        .filter(function (n) {
+          const ln = n.toLowerCase();
+          return ln.indexOf('kcc') !== -1 || ln.indexOf('master') !== -1;
+        });
+      console.info('[MedHub data][diag] page ' + (pages + 1)
+        + ' itemCount=' + items.length
+        + ' kcc/master-matching names: ' + JSON.stringify(relevantNames));
+      for (const it of items) {
+        const remote = it.remoteItem;
+        if (!remote) continue;
+        const name = (it.name || remote.name || '');
+        if (name.toLowerCase() !== WORKBOOK_FILENAME.toLowerCase()) continue;
+        const driveId = remote.parentReference && remote.parentReference.driveId;
+        const itemId = remote.id;
+        if (!driveId || !itemId) continue;
+        matches.push({
+          driveId: driveId,
+          itemId: itemId,
+          ownerName: (remote.shared && remote.shared.owner && remote.shared.owner.user
+            && remote.shared.owner.user.displayName) || '(unknown owner)',
+          lastModified: remote.lastModifiedDateTime || '(unknown date)',
+        });
+      }
+      url = result && result['@odata.nextLink'];
+      pages++;
+    }
+    console.info('[MedHub data][diag] _findInSharedWithMe done ' + JSON.stringify({
+      totalItems: totalItems, matchesAfterFilter: matches.length, pagesRead: pages,
+    }));
+    if (matches.length === 0) return null;
+    if (matches.length === 1) return matches[0];
+    const detail = matches.map(function (m) {
+      return '  • ' + m.ownerName + ' (modified ' + m.lastModified + ')';
+    }).join('\n');
+    throw _typedError(ERR_WORKBOOK_AMBIGUOUS,
+      'Multiple workbooks named ' + WORKBOOK_FILENAME + ' shared with this account',
+      { detail: detail });
+  }
+
+  // If persistChanges:true 403s (Viewer-only share), fall back to a non-persistent
+  // session so reads still work. _readOnly is sticky for the lifetime of the page
+  // so we don't re-probe on every session refresh; write paths consult it before
+  // attempting Graph and surface ERR_WORKBOOK_NO_EDIT_ACCESS.
   async function _createSession() {
     if (_sessionId) return;
     const path = '/drives/' + _driveId + '/items/' + _itemId + '/workbook/createSession';
-    const result = await _graph('POST', path, { persistChanges: true });
-    _sessionId = result.id;
+
+    if (_readOnly) {
+      const result = await _graph('POST', path, { persistChanges: false });
+      _sessionId = result.id;
+    } else {
+      try {
+        const result = await _graph('POST', path, { persistChanges: true });
+        _sessionId = result.id;
+      } catch (err) {
+        if (err.status === 403) {
+          console.info('[MedHub data] persistChanges:true denied, falling back to view-only session');
+          const result = await _graph('POST', path, { persistChanges: false });
+          _sessionId = result.id;
+          _readOnly = true;
+        } else {
+          throw err;
+        }
+      }
+    }
     _sessionLastUsedAt = Date.now();
     // Log last 6 chars of session ID so the timeout test can verify the ID changed.
     const tail = _sessionId.length >= 6 ? _sessionId.slice(-6) : _sessionId;
-    console.info('[MedHub data] workbook session created (…' + tail + ')');
+    console.info('[MedHub data] workbook session created (…' + tail + ') readOnly=' + _readOnly);
   }
 
   async function _ensureFreshSession() {
@@ -222,11 +376,22 @@
   //       only; address in M5 display layer.
   async function addMedication(medRow) {
     if (!_loaded) throw new Error('Call loadMedications first.');
+    if (_readOnly) {
+      throw _typedError(ERR_WORKBOOK_NO_EDIT_ACCESS, 'No edit access to workbook');
+    }
     await _ensureFreshSession();
     const values = [FIELDS.map(function (f) { return _toStr(medRow[f]); })];
     const path = '/drives/' + _driveId + '/items/' + _itemId
       + '/workbook/tables/' + TABLE_NAME + '/rows/add';
-    await _graph('POST', path, { values: values }, _sessionHeader());
+    try {
+      await _graph('POST', path, { values: values }, _sessionHeader());
+    } catch (err) {
+      if (err.status === 403) {
+        _readOnly = true;
+        throw _typedError(ERR_WORKBOOK_NO_EDIT_ACCESS, 'No edit access to workbook');
+      }
+      throw err;
+    }
     await _refresh();
     console.info('[MedHub data] add ok, total now', _meds.length);
     return _meds.length;
@@ -279,9 +444,28 @@
   }
 
   function _formatErrDetail(err) {
-    if (err && err.status >= 500 && err.status < 600) return 'Connection error, try again';
-    if (err && err.status) return err.status + ' ' + (err.code || '');
-    return (err && err.message) || 'Unknown error';
+    // M5.1 diag — remove with the others.
+    console.info('[MedHub data][diag] _formatErrDetail received ' + JSON.stringify({
+      status: err && err.status,
+      code: err && err.code,
+      medhubCode: err && err.medhubCode,
+      message: err && err.message,
+    }));
+    if (!err) return 'Unknown error';
+    if (err.medhubCode === ERR_WORKBOOK_NOT_SHARED) {
+      return "This workbook hasn't been shared with your account. Ask KCCnurse to share KCC_Master.xlsx with you with Edit permissions.";
+    }
+    if (err.medhubCode === ERR_WORKBOOK_AMBIGUOUS) {
+      return 'Multiple workbooks named KCC_Master.xlsx are shared with you:\n'
+        + (err.detail || '')
+        + '\nAsk KCCnurse to remove the older share.';
+    }
+    if (err.medhubCode === ERR_WORKBOOK_NO_EDIT_ACCESS) {
+      return "You can view this workbook but don't have Edit access. Ask KCCnurse to re-share with Edit permissions.";
+    }
+    if (err.status >= 500 && err.status < 600) return 'Connection error, try again';
+    if (err.status) return err.status + ' ' + (err.code || '');
+    return err.message || 'Unknown error';
   }
 
   async function _onSignedIn() {
